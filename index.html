@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ant Escape</title>
+<style>
+  :root {
+    --panel: rgba(28, 20, 12, 0.92);
+    --ink: #f6ead2;
+    --muted: #c9b48f;
+    --accent: #ffcf4a;
+    --edge: #6b4f2c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: #3b2a18; color: var(--ink);
+    font-family: "Trebuchet MS", system-ui, sans-serif;
+  }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+  .overlay {
+    position: fixed; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(10, 6, 2, 0.55); padding: 16px;
+  }
+  .overlay.show { display: flex; }
+  .panel {
+    background: var(--panel); border: 2px solid var(--edge); border-radius: 14px;
+    padding: 24px 28px; max-width: 640px; width: 100%; text-align: center;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+  }
+  h1 { margin: 0 0 6px; font-size: 44px; color: var(--accent); letter-spacing: 1px; }
+  h2 { margin: 0 0 14px; font-size: 28px; color: var(--accent); }
+  p { margin: 6px 0; color: var(--muted); line-height: 1.45; }
+  .keys { font-size: 14px; margin-top: 14px; }
+  b { color: var(--ink); }
+  button {
+    font: inherit; font-size: 18px; cursor: pointer;
+    background: var(--accent); color: #2a1a08; border: none; border-radius: 10px;
+    padding: 12px 26px; margin-top: 18px; font-weight: bold;
+  }
+  button:hover { filter: brightness(1.1); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+  .card {
+    background: #2b1e10; border: 2px solid var(--edge); border-radius: 12px;
+    padding: 14px 12px; cursor: pointer; text-align: left; color: var(--ink);
+    margin: 0; font-weight: normal; font-size: 15px;
+  }
+  .card:hover { border-color: var(--accent); filter: none; background: #3a2915; }
+  .card .name { color: var(--accent); font-weight: bold; font-size: 17px; display: block; margin-bottom: 6px; }
+  .card .lvl { color: var(--muted); font-size: 12px; float: right; }
+  .card .desc { color: var(--muted); font-size: 14px; }
+  .card .num { color: var(--muted); font-size: 12px; display: block; margin-top: 8px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; margin: 12px auto; max-width: 320px; text-align: left; }
+  .stats span:nth-child(even) { text-align: right; color: var(--ink); font-weight: bold; }
+  .stats span:nth-child(odd) { color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="overlay show" id="menu">
+  <div class="panel">
+    <h1>Ant Escape</h1>
+    <p>Your little ant scurries toward your cursor. Everything in the garden wants to eat it.</p>
+    <p>The ant sprays acid automatically. Collect <b>crumbs</b> to level up and pick a mutation. A boss shows up every 90 seconds.</p>
+    <p class="keys"><b>Mouse</b> to move &nbsp;·&nbsp; <b>Click / Space</b> to scurry (dash) &nbsp;·&nbsp; <b>P / Esc</b> to pause</p>
+    <p class="keys" id="best"></p>
+    <button id="startBtn">Start</button>
+  </div>
+</div>
+
+<div class="overlay" id="levelup">
+  <div class="panel">
+    <h2>Level up! Pick a mutation</h2>
+    <div class="cards" id="cards"></div>
+  </div>
+</div>
+
+<div class="overlay" id="pause">
+  <div class="panel">
+    <h2>Paused</h2>
+    <p>Press <b>P</b> or <b>Esc</b>, or click below to keep going.</p>
+    <button id="resumeBtn">Resume</button>
+  </div>
+</div>
+
+<div class="overlay" id="dead">
+  <div class="panel">
+    <h2>Your ant was squished</h2>
+    <div class="stats" id="deathStats"></div>
+    <p id="newBest"></p>
+    <button id="retryBtn">Try again</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  let W = 0, H = 0, DPR = 1;
+  let bg = null;
+
+  const TAU = Math.PI * 2;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const dist2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+  const angleLerp = (a, b, t) => {
+    let d = ((b - a + Math.PI) % TAU + TAU) % TAU - Math.PI;
+    return a + d * t;
+  };
+  const fmtTime = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+
+  function loadBest() {
+    try { return JSON.parse(localStorage.getItem("antEscapeBest")) || null; } catch { return null; }
+  }
+  function saveBest(b) {
+    try { localStorage.setItem("antEscapeBest", JSON.stringify(b)); } catch {}
+  }
+
+  // ---------- Background ----------
+  function buildBackground() {
+    bg = document.createElement("canvas");
+    bg.width = W; bg.height = H;
+    const b = bg.getContext("2d");
+    const grad = b.createRadialGradient(W / 2, H / 2, 50, W / 2, H / 2, Math.max(W, H) * 0.7);
+    grad.addColorStop(0, "#8a6a42");
+    grad.addColorStop(1, "#5a4026");
+    b.fillStyle = grad;
+    b.fillRect(0, 0, W, H);
+    const area = W * H;
+    for (let i = 0; i < area / 90; i++) {
+      b.fillStyle = `rgba(${Math.random() < 0.5 ? "40,25,10" : "190,160,110"},${rand(0.08, 0.25)})`;
+      b.fillRect(rand(0, W), rand(0, H), rand(1, 3), rand(1, 3));
+    }
+    for (let i = 0; i < area / 9000; i++) {
+      const x = rand(0, W), y = rand(0, H), r = rand(3, 9);
+      b.fillStyle = `hsl(30, ${rand(5, 20)}%, ${rand(35, 60)}%)`;
+      b.beginPath(); b.ellipse(x, y, r, r * rand(0.6, 0.9), rand(0, TAU), 0, TAU); b.fill();
+      b.fillStyle = "rgba(255,255,255,0.12)";
+      b.beginPath(); b.ellipse(x - r * 0.3, y - r * 0.3, r * 0.35, r * 0.25, 0, 0, TAU); b.fill();
+    }
+    // Grass tufts along the edges
+    for (let i = 0; i < (W + H) / 12; i++) {
+      let x, y;
+      const side = Math.floor(rand(0, 4));
+      if (side === 0) { x = rand(0, W); y = rand(0, 18); }
+      else if (side === 1) { x = rand(0, W); y = H - rand(0, 18); }
+      else if (side === 2) { x = rand(0, 18); y = rand(0, H); }
+      else { x = W - rand(0, 18); y = rand(0, H); }
+      b.strokeStyle = `hsl(${rand(85, 115)}, 45%, ${rand(25, 40)}%)`;
+      b.lineWidth = 2;
+      for (let k = 0; k < 3; k++) {
+        b.beginPath(); b.moveTo(x, y);
+        b.quadraticCurveTo(x + rand(-6, 6), y - 8, x + rand(-10, 10), y - rand(10, 20));
+        b.stroke();
+      }
+    }
+  }
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    buildBackground();
+    if (game) {
+      game.ant.x = clamp(game.ant.x, 10, W - 10);
+      game.ant.y = clamp(game.ant.y, 10, H - 10);
+    }
+  }
+
+  // ---------- Input ----------
+  const mouse = { x: 0, y: 0 };
+  canvas.addEventListener("pointermove", e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+  canvas.addEventListener("pointerdown", e => {
+    mouse.x = e.clientX; mouse.y = e.clientY;
+    if (game && game.state === "playing") tryDash();
+  });
+  canvas.addEventListener("contextmenu", e => e.preventDefault());
+  window.addEventListener("keydown", e => {
+    if (!game) return;
+    if (e.code === "Space") { e.preventDefault(); if (game.state === "playing") tryDash(); }
+    if (e.code === "KeyP" || e.code === "Escape") togglePause();
+    if (game.state === "levelup" && ["Digit1", "Digit2", "Digit3"].includes(e.code)) {
+      const btn = document.querySelectorAll("#cards .card")[Number(e.code.slice(-1)) - 1];
+      if (btn) btn.click();
+    }
+  });
+  window.addEventListener("blur", () => { if (game && game.state === "playing") togglePause(); });
+
+  // ---------- Upgrades ----------
+  const UPGRADES = [
+    { id: "hp", name: "Thick Exoskeleton", desc: "+1 max health and heal 1.", max: 6,
+      apply: g => { g.ant.maxHp += 1; g.ant.hp = Math.min(g.ant.maxHp, g.ant.hp + 1); } },
+    { id: "speed", name: "Long Legs", desc: "Move 12% faster.", max: 5,
+      apply: g => { g.ant.speed *= 1.12; } },
+    { id: "dmg", name: "Potent Acid", desc: "+40% acid damage.", max: 8,
+      apply: g => { g.stats.damage *= 1.4; } },
+    { id: "rate", name: "Rapid Glands", desc: "Spray acid 18% faster.", max: 6,
+      apply: g => { g.stats.fireDelay *= 0.82; } },
+    { id: "multi", name: "Split Spray", desc: "+1 acid glob per spray.", max: 5,
+      apply: g => { g.stats.shots += 1; } },
+    { id: "pierce", name: "Corrosive Acid", desc: "Acid passes through +1 more bug.", max: 4,
+      apply: g => { g.stats.pierce += 1; } },
+    { id: "magnet", name: "Keen Antennae", desc: "Grab crumbs from farther away and spray at longer range.", max: 4,
+      apply: g => { g.stats.magnet *= 1.45; g.stats.range *= 1.15; } },
+    { id: "regen", name: "Royal Jelly", desc: "Slowly regenerate health.", max: 4,
+      apply: g => { g.stats.regen += 1 / 22; } },
+    { id: "thorns", name: "Spiky Carapace", desc: "When hit, burst acid in every direction.", max: 3,
+      apply: g => { g.stats.thorns += 6; } },
+    { id: "workers", name: "Worker Escort", desc: "A worker ant circles you and bites bugs.", max: 4,
+      apply: g => { g.stats.workers += 1; } },
+    { id: "dash", name: "Scurry Instinct", desc: "Dash recharges 30% faster.", max: 3,
+      apply: g => { g.stats.dashCd *= 0.7; } },
+  ];
+
+  // ---------- Game state ----------
+  let game = null;
+
+  function newGame() {
+    game = {
+      state: "playing",
+      time: 0,
+      kills: 0,
+      level: 1,
+      xp: 0,
+      xpNext: 4,
+      pendingLevels: 0,
+      spawnBudget: 0,
+      nextBoss: 90,
+      bossCount: 0,
+      shake: 0,
+      banner: { text: "Survive!", t: 2 },
+      ant: { x: W / 2, y: H / 2, r: 9, angle: -Math.PI / 2, phase: 0, hp: 5, maxHp: 5,
+             speed: 210, iframes: 0, dashT: 0, dashCd: 0, dashDir: 0, regenAcc: 0 },
+      stats: { damage: 1.5, fireDelay: 0.45, shots: 1, pierce: 0, range: 300, magnet: 70,
+               projSpeed: 430, regen: 0, thorns: 0, workers: 0, dashCd: 2.5 },
+      upgradeLevels: {},
+      fireT: 0,
+      workerAngle: 0,
+      enemies: [],
+      shots: [],
+      enemyShots: [],
+      pickups: [],
+      particles: [],
+      texts: [],
+    };
+    mouse.x = W / 2; mouse.y = H / 2;
+  }
+
+  // ---------- Enemies ----------
+  const ENEMY_TYPES = {
+    spider:     { hp: 3,  speed: 95,  r: 10, dmg: 1, xp: 1, color: "#2a2230" },
+    wasp:       { hp: 2,  speed: 70,  r: 9,  dmg: 1, xp: 2, color: "#f2c230" },
+    beetle:     { hp: 14, speed: 42,  r: 16, dmg: 2, xp: 4, color: "#1f4a52" },
+    bombardier: { hp: 5,  speed: 60,  r: 11, dmg: 1, xp: 3, color: "#d0601e" },
+    spiderling: { hp: 1,  speed: 140, r: 6,  dmg: 1, xp: 0, color: "#3a2f40" },
+    queen:      { hp: 140, speed: 55, r: 34, dmg: 2, xp: 30, color: "#3b1f4a" },
+  };
+
+  function edgeSpawnPoint(margin = 30) {
+    const side = Math.floor(rand(0, 4));
+    if (side === 0) return { x: rand(0, W), y: -margin };
+    if (side === 1) return { x: rand(0, W), y: H + margin };
+    if (side === 2) return { x: -margin, y: rand(0, H) };
+    return { x: W + margin, y: rand(0, H) };
+  }
+
+  function spawnEnemy(type, pos) {
+    const t = ENEMY_TYPES[type];
+    const p = pos || edgeSpawnPoint();
+    const hpScale = 1 + game.time / 75;
+    const e = {
+      type, x: p.x, y: p.y, r: t.r, dmg: t.dmg, xp: t.xp, color: t.color,
+      hp: t.hp * hpScale, maxHp: t.hp * hpScale,
+      speed: t.speed * (1 + Math.min(game.time / 400, 0.5)) * rand(0.9, 1.1),
+      angle: 0, phase: rand(0, TAU), flash: 0, vx: 0, vy: 0,
+      timer: rand(1, 2.5), mode: "approach", timer2: 3,
+    };
+    if (type === "queen") {
+      e.hp = e.maxHp = t.hp * (1 + game.bossCount * 0.8) * (1 + game.time / 300);
+      e.speed = t.speed;
+      e.timer = 2; e.timer2 = 3.5;
+    }
+    game.enemies.push(e);
+    return e;
+  }
+
+  function pickEnemyType() {
+    const t = game.time;
+    const pool = [["spider", 10]];
+    if (t > 25) pool.push(["wasp", 4 + t / 40]);
+    if (t > 50) pool.push(["beetle", 2 + t / 80]);
+    if (t > 70) pool.push(["bombardier", 2 + t / 70]);
+    let total = pool.reduce((s, p) => s + p[1], 0);
+    let r = Math.random() * total;
+    for (const [type, w] of pool) { if ((r -= w) <= 0) return type; }
+    return "spider";
+  }
+
+  function updateSpawning(dt) {
+    const rate = Math.min(0.6 + game.time * 0.016, 7);
+    game.spawnBudget += rate * dt;
+    while (game.spawnBudget >= 1) {
+      game.spawnBudget -= 1;
+      if (game.enemies.length < 160) spawnEnemy(pickEnemyType());
+    }
+    if (game.time >= game.nextBoss) {
+      game.nextBoss += 90;
+      game.bossCount += 1;
+      spawnEnemy("queen");
+      game.banner = { text: "The Spider Queen approaches!", t: 3 };
+    }
+  }
+
+  function enemyShoot(e, angle, speed = 170) {
+    game.enemyShots.push({ x: e.x, y: e.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed, r: 5, life: 6 });
+  }
+
+  function updateEnemy(e, dt) {
+    const ant = game.ant;
+    const dx = ant.x - e.x, dy = ant.y - e.y;
+    const d = Math.hypot(dx, dy) || 1;
+    const toAnt = Math.atan2(dy, dx);
+    let mvx = 0, mvy = 0;
+
+    switch (e.type) {
+      case "spider":
+      case "spiderling":
+      case "beetle":
+        mvx = dx / d * e.speed; mvy = dy / d * e.speed;
+        e.angle = angleLerp(e.angle, toAnt, Math.min(1, dt * 6));
+        break;
+      case "wasp":
+        e.timer -= dt;
+        if (e.mode === "approach") {
+          const wobble = Math.sin(game.time * 3 + e.phase) * 0.8;
+          const a = toAnt + wobble;
+          mvx = Math.cos(a) * e.speed; mvy = Math.sin(a) * e.speed;
+          e.angle = angleLerp(e.angle, toAnt, Math.min(1, dt * 5));
+          if (e.timer <= 0 && d < 320) { e.mode = "windup"; e.timer = 0.6; }
+        } else if (e.mode === "windup") {
+          e.angle = angleLerp(e.angle, toAnt, Math.min(1, dt * 8));
+          if (e.timer <= 0) { e.mode = "dash"; e.timer = 0.45; }
+        } else {
+          mvx = Math.cos(e.angle) * 480; mvy = Math.sin(e.angle) * 480;
+          if (e.timer <= 0) { e.mode = "approach"; e.timer = rand(1.5, 3); }
+        }
+        break;
+      case "bombardier": {
+        const want = 220;
+        const s = d > want + 30 ? 1 : d < want - 30 ? -1 : 0;
+        const strafe = Math.sin(game.time + e.phase) > 0 ? 1 : -1;
+        mvx = (dx / d * s - dy / d * 0.5 * strafe) * e.speed;
+        mvy = (dy / d * s + dx / d * 0.5 * strafe) * e.speed;
+        e.angle = angleLerp(e.angle, toAnt, Math.min(1, dt * 5));
+        e.timer -= dt;
+        const onScreen = e.x > 0 && e.x < W && e.y > 0 && e.y < H;
+        if (e.timer <= 0 && onScreen) { enemyShoot(e, toAnt); e.timer = rand(1.8, 2.6); }
+        break;
+      }
+      case "queen":
+        mvx = dx / d * e.speed; mvy = dy / d * e.speed;
+        e.angle = angleLerp(e.angle, toAnt, Math.min(1, dt * 2));
+        e.timer -= dt; e.timer2 -= dt;
+        if (e.timer <= 0) {
+          const n = 12 + game.bossCount * 2, off = rand(0, TAU);
+          for (let i = 0; i < n; i++) enemyShoot(e, off + i / n * TAU, 150);
+          e.timer = 2.6;
+        }
+        if (e.timer2 <= 0) {
+          for (let i = 0; i < 3 + game.bossCount; i++)
+            spawnEnemy("spiderling", { x: e.x + rand(-20, 20), y: e.y + rand(-20, 20) });
+          e.timer2 = 4.5;
+        }
+        break;
+    }
+
+    // knockback decay
+    e.vx *= Math.pow(0.02, dt); e.vy *= Math.pow(0.02, dt);
+    e.x += (mvx + e.vx) * dt;
+    e.y += (mvy + e.vy) * dt;
+    e.phase += Math.hypot(mvx, mvy) * dt * 0.12;
+    if (e.flash > 0) e.flash -= dt;
+  }
+
+  function separateEnemies() {
+    const es = game.enemies;
+    for (let i = 0; i < es.length; i++) {
+      for (let j = i + 1; j < es.length; j++) {
+        const a = es[i], b = es[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const min = (a.r + b.r) * 0.85;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > 0 && d2 < min * min) {
+          const d = Math.sqrt(d2), push = (min - d) / 2;
+          const nx = dx / d, ny = dy / d;
+          const wa = a.type === "queen" ? 0.1 : 1, wb = b.type === "queen" ? 0.1 : 1;
+          a.x -= nx * push * wa; a.y -= ny * push * wa;
+          b.x += nx * push * wb; b.y += ny * push * wb;
+        }
+      }
+    }
+  }
+
+  // ---------- Combat ----------
+  function damageEnemy(e, amount, kx = 0, ky = 0) {
+    e.hp -= amount;
+    e.flash = 0.1;
+    const kb = e.type === "queen" ? 0.1 : e.type === "beetle" ? 0.4 : 1;
+    e.vx += kx * kb; e.vy += ky * kb;
+    burst(e.x, e.y, "#b7f04a", 3, 80);
+    if (e.hp <= 0 && !e.dead) killEnemy(e);
+  }
+
+  function killEnemy(e) {
+    e.dead = true;
+    game.kills += 1;
+    burst(e.x, e.y, e.type === "wasp" ? "#f2c230" : "#6e5a7a", e.type === "queen" ? 40 : 10, 160);
+    const n = e.xp;
+    for (let i = 0; i < n; i++) {
+      game.pickups.push({ kind: "crumb", x: e.x + rand(-e.r, e.r), y: e.y + rand(-e.r, e.r), r: 4, t: 0 });
+    }
+    if (e.type === "queen") {
+      game.pickups.push({ kind: "sugar", x: e.x, y: e.y, r: 7, t: 0 });
+      game.pickups.push({ kind: "sugar", x: e.x + 20, y: e.y, r: 7, t: 0 });
+      game.banner = { text: "Queen defeated!", t: 2.5 };
+      game.shake = 12;
+    } else if (Math.random() < 0.025) {
+      game.pickups.push({ kind: "sugar", x: e.x, y: e.y, r: 7, t: 0 });
+    }
+  }
+
+  function hurtAnt(amount) {
+    const ant = game.ant;
+    if (ant.iframes > 0 || ant.dashT > 0) return;
+    ant.hp -= amount;
+    ant.iframes = 1.0;
+    game.shake = 10;
+    burst(ant.x, ant.y, "#ff5a4a", 14, 180);
+    floatText(ant.x, ant.y - 18, `-${amount}`, "#ff6b5b");
+    if (game.stats.thorns > 0) {
+      const n = game.stats.thorns, off = rand(0, TAU);
+      for (let i = 0; i < n; i++) fireShot(off + i / n * TAU, 3);
+    }
+    if (ant.hp <= 0) die();
+  }
+
+  function fireShot(angle, pierceBonus = 0) {
+    const s = game.stats, ant = game.ant;
+    game.shots.push({
+      x: ant.x + Math.cos(angle) * 10, y: ant.y + Math.sin(angle) * 10,
+      vx: Math.cos(angle) * s.projSpeed, vy: Math.sin(angle) * s.projSpeed,
+      r: 4, life: s.range / s.projSpeed * 1.2, pierce: s.pierce + pierceBonus, hit: new Set(),
+    });
+  }
+
+  function updateWeapon(dt) {
+    const s = game.stats, ant = game.ant;
+    game.fireT -= dt;
+    if (game.fireT > 0) return;
+    let best = null, bestD = s.range * s.range;
+    for (const e of game.enemies) {
+      const d = dist2(e, ant);
+      if (d < bestD) { bestD = d; best = e; }
+    }
+    if (!best) return;
+    // lead the target slightly
+    const lead = Math.sqrt(bestD) / s.projSpeed;
+    const tx = best.x + best.vx * lead * 0.3, ty = best.y + best.vy * lead * 0.3;
+    const base = Math.atan2(ty - ant.y, tx - ant.x);
+    const spread = 0.18;
+    for (let i = 0; i < s.shots; i++) fireShot(base + (i - (s.shots - 1) / 2) * spread);
+    game.fireT = s.fireDelay;
+  }
+
+  function updateWorkers(dt) {
+    const n = game.stats.workers;
+    if (!n) return;
+    game.workerAngle += dt * 2.6;
+    const ant = game.ant;
+    for (let i = 0; i < n; i++) {
+      const a = game.workerAngle + i / n * TAU;
+      const wx = ant.x + Math.cos(a) * 48, wy = ant.y + Math.sin(a) * 48;
+      for (const e of game.enemies) {
+        if (e.dead) continue;
+        e.biteCd = (e.biteCd || 0) - dt / n;
+        if (e.biteCd <= 0 && (e.x - wx) ** 2 + (e.y - wy) ** 2 < (e.r + 7) ** 2) {
+          damageEnemy(e, 1.5 * Math.max(1, game.stats.damage * 0.8), Math.cos(a) * 120, Math.sin(a) * 120);
+          e.biteCd = 0.4;
+        }
+      }
+    }
+  }
+
+  function tryDash() {
+    const ant = game.ant;
+    if (ant.dashCd > 0) return;
+    ant.dashDir = Math.atan2(mouse.y - ant.y, mouse.x - ant.x);
+    if (Math.hypot(mouse.y - ant.y, mouse.x - ant.x) < 4) ant.dashDir = ant.angle;
+    ant.dashT = 0.18;
+    ant.dashCd = game.stats.dashCd;
+    burst(ant.x, ant.y, "#e8d6b0", 8, 90);
+  }
+
+  // ---------- Effects ----------
+  function burst(x, y, color, n, speed) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, TAU), s = rand(speed * 0.3, speed);
+      game.particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.25, 0.6), max: 0.6, color, r: rand(1.5, 3.5) });
+    }
+  }
+  function floatText(x, y, text, color) {
+    game.texts.push({ x, y, text, color, t: 1 });
+  }
+
+  // ---------- Progression ----------
+  function gainXp(n) {
+    game.xp += n;
+    while (game.xp >= game.xpNext) {
+      game.xp -= game.xpNext;
+      game.level += 1;
+      game.xpNext = Math.floor(3 + game.level * 2.5 + game.level ** 1.5);
+      game.pendingLevels += 1;
+    }
+  }
+
+  function availableUpgrades() {
+    return UPGRADES.filter(u => (game.upgradeLevels[u.id] || 0) < u.max);
+  }
+
+  function openLevelUp() {
+    game.state = "levelup";
+    const pool = availableUpgrades();
+    const choices = [];
+    while (choices.length < 3 && pool.length) {
+      choices.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+    }
+    if (!choices.length) { // everything maxed: just heal
+      game.ant.hp = game.ant.maxHp; game.pendingLevels = 0; game.state = "playing"; return;
+    }
+    const cards = document.getElementById("cards");
+    cards.innerHTML = "";
+    choices.forEach((u, i) => {
+      const lvl = game.upgradeLevels[u.id] || 0;
+      const b = document.createElement("button");
+      b.className = "card";
+      b.innerHTML = `<span class="lvl">${lvl}/${u.max}</span><span class="name"></span><span class="desc"></span><span class="num">Press ${i + 1}</span>`;
+      b.querySelector(".name").textContent = u.name;
+      b.querySelector(".desc").textContent = u.desc;
+      b.addEventListener("click", () => {
+        u.apply(game);
+        game.upgradeLevels[u.id] = lvl + 1;
+        game.pendingLevels -= 1;
+        document.getElementById("levelup").classList.remove("show");
+        game.state = "playing";
+        lastFrame = performance.now();
+      });
+      cards.appendChild(b);
+    });
+    document.getElementById("levelup").classList.add("show");
+  }
+
+  function togglePause() {
+    if (!game) return;
+    const el = document.getElementById("pause");
+    if (game.state === "playing") { game.state = "paused"; el.classList.add("show"); }
+    else if (game.state === "paused") { game.state = "playing"; el.classList.remove("show"); lastFrame = performance.now(); }
+  }
+
+  function die() {
+    game.state = "dead";
+    burst(game.ant.x, game.ant.y, "#2a1a10", 30, 200);
+    const best = loadBest();
+    const isBest = !best || game.time > best.time;
+    if (isBest) saveBest({ time: game.time, kills: game.kills, level: game.level });
+    const stats = [
+      ["Survived", fmtTime(game.time)],
+      ["Bugs squashed", game.kills],
+      ["Level reached", game.level],
+      ["Queens slain", Math.max(0, game.bossCount - (game.enemies.some(e => e.type === "queen") ? 1 : 0))],
+    ];
+    const box = document.getElementById("deathStats");
+    box.innerHTML = "";
+    for (const [k, v] of stats) {
+      const a = document.createElement("span"); a.textContent = k;
+      const b = document.createElement("span"); b.textContent = v;
+      box.append(a, b);
+    }
+    document.getElementById("newBest").textContent = isBest
+      ? "New personal best!"
+      : `Best: ${fmtTime(best.time)} · ${best.kills} bugs`;
+    setTimeout(() => document.getElementById("dead").classList.add("show"), 700);
+  }
+
+  // ---------- Update ----------
+  function update(dt) {
+    game.time += dt;
+    const ant = game.ant;
+    const s = game.stats;
+
+    // Movement toward the cursor
+    let moved = 0;
+    if (ant.dashT > 0) {
+      ant.dashT -= dt;
+      const step = 900 * dt;
+      ant.x += Math.cos(ant.dashDir) * step; ant.y += Math.sin(ant.dashDir) * step;
+      ant.angle = ant.dashDir; moved = step;
+      if (Math.random() < 0.7) game.particles.push({ x: ant.x, y: ant.y, vx: 0, vy: 0, life: 0.25, max: 0.25, color: "rgba(30,18,8,0.6)", r: 6 });
+    } else {
+      const dx = mouse.x - ant.x, dy = mouse.y - ant.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 3) {
+        moved = Math.min(d, ant.speed * dt);
+        ant.x += dx / d * moved; ant.y += dy / d * moved;
+        ant.angle = angleLerp(ant.angle, Math.atan2(dy, dx), Math.min(1, dt * 12));
+      }
+    }
+    ant.x = clamp(ant.x, ant.r, W - ant.r);
+    ant.y = clamp(ant.y, ant.r, H - ant.r);
+    ant.phase += moved * 0.22;
+    if (ant.iframes > 0) ant.iframes -= dt;
+    if (ant.dashCd > 0) ant.dashCd -= dt;
+    if (s.regen > 0 && ant.hp < ant.maxHp) {
+      ant.regenAcc += s.regen * dt;
+      if (ant.regenAcc >= 1) { ant.regenAcc -= 1; ant.hp += 1; floatText(ant.x, ant.y - 18, "+1", "#7dff8a"); }
+    }
+
+    updateSpawning(dt);
+    updateWeapon(dt);
+    for (const e of game.enemies) updateEnemy(e, dt);
+    separateEnemies();
+    updateWorkers(dt);
+
+    // Player shots
+    for (const p of game.shots) {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      for (const e of game.enemies) {
+        if (e.dead || p.hit.has(e)) continue;
+        if (dist2(p, e) < (p.r + e.r) ** 2) {
+          p.hit.add(e);
+          const n = Math.hypot(p.vx, p.vy);
+          damageEnemy(e, s.damage, p.vx / n * 140, p.vy / n * 140);
+          if (p.pierce-- <= 0) { p.life = 0; break; }
+        }
+      }
+    }
+    game.shots = game.shots.filter(p => p.life > 0 && p.x > -20 && p.x < W + 20 && p.y > -20 && p.y < H + 20);
+
+    // Enemy shots
+    for (const p of game.enemyShots) {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      if (game.state === "playing" && dist2(p, ant) < (p.r + ant.r * 0.8) ** 2 && ant.iframes <= 0 && ant.dashT <= 0) {
+        p.life = 0; hurtAnt(1);
+      }
+    }
+    game.enemyShots = game.enemyShots.filter(p => p.life > 0);
+
+    // Contact damage
+    for (const e of game.enemies) {
+      if (e.dead || game.state !== "playing") continue;
+      if (dist2(e, ant) < (e.r + ant.r * 0.8) ** 2) {
+        if (ant.iframes <= 0 && ant.dashT <= 0) {
+          hurtAnt(e.dmg);
+          const a = Math.atan2(e.y - ant.y, e.x - ant.x);
+          e.vx += Math.cos(a) * 300; e.vy += Math.sin(a) * 300;
+        }
+      }
+    }
+    game.enemies = game.enemies.filter(e => !e.dead && e.x > -400 && e.x < W + 400 && e.y > -400 && e.y < H + 400);
+
+    // Pickups
+    for (const p of game.pickups) {
+      p.t += dt;
+      const d = Math.sqrt(dist2(p, ant));
+      if (d < s.magnet || p.pulled) {
+        p.pulled = true;
+        const sp = 260 + p.t * 200;
+        p.x += (ant.x - p.x) / d * sp * dt; p.y += (ant.y - p.y) / d * sp * dt;
+      }
+      if (d < ant.r + p.r + 2) {
+        p.taken = true;
+        if (p.kind === "crumb") gainXp(1);
+        else { ant.hp = Math.min(ant.maxHp, ant.hp + 1); floatText(ant.x, ant.y - 18, "+1", "#7dff8a"); }
+      }
+    }
+    game.pickups = game.pickups.filter(p => !p.taken);
+
+    if (game.pendingLevels > 0 && game.state === "playing") openLevelUp();
+  }
+
+  function updateEffects(dt) {
+    for (const p of game.particles) {
+      p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.9; p.vy *= 0.9; p.life -= dt;
+    }
+    game.particles = game.particles.filter(p => p.life > 0);
+    for (const t of game.texts) { t.y -= 30 * dt; t.t -= dt; }
+    game.texts = game.texts.filter(t => t.t > 0);
+    if (game.shake > 0) game.shake = Math.max(0, game.shake - dt * 40);
+    if (game.banner.t > 0) game.banner.t -= dt;
+  }
+
+  // ---------- Drawing ----------
+  function drawLeg(x1, y1, kx, ky, x2, y2) {
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(kx, ky); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+
+  function drawAnt(x, y, angle, phase, scale, body, light) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(angle); ctx.scale(scale, scale);
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.beginPath(); ctx.ellipse(-2, 3, 18, 8, 0, 0, TAU); ctx.fill();
+    // legs (tripod gait)
+    ctx.strokeStyle = body; ctx.lineWidth = 1.6; ctx.lineCap = "round";
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < 3; i++) {
+        const group = (i + (side > 0 ? 1 : 0)) % 2;
+        const swing = Math.sin(phase + group * Math.PI) * 4;
+        const bx = -2 + i * 2.5;
+        const fx = bx + (i - 1) * 8 + swing;
+        drawLeg(bx, side * 2, bx + (i - 1) * 3 + swing * 0.4, side * 8, fx, side * 13);
+      }
+    }
+    // antennae
+    const tw = Math.sin(phase * 0.5) * 1.5;
+    ctx.lineWidth = 1.2;
+    for (const side of [-1, 1]) {
+      ctx.beginPath(); ctx.moveTo(10, side * 2); ctx.lineTo(15, side * 4); ctx.lineTo(20 + tw, side * (7 - tw)); ctx.stroke();
+    }
+    ctx.fillStyle = body;
+    // abdomen, thorax, head
+    ctx.beginPath(); ctx.ellipse(-11, 0, 8, 6, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(-3.5, 0, 2, 1.5, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(1, 0, 5, 3.4, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(9, 0, 4.5, 0, TAU); ctx.fill();
+    // mandibles
+    ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.moveTo(12, -2); ctx.lineTo(15, -1); ctx.moveTo(12, 2); ctx.lineTo(15, 1); ctx.stroke();
+    // shine
+    ctx.fillStyle = light;
+    ctx.beginPath(); ctx.ellipse(-12, -2.5, 3.5, 1.6, -0.2, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(8.5, -1.8, 1.6, 1, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawSpider(e, scale) {
+    ctx.save();
+    ctx.translate(e.x, e.y); ctx.rotate(e.angle); ctx.scale(scale, scale);
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    ctx.beginPath(); ctx.ellipse(-2, 3, 14, 11, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = e.flash > 0 ? "#fff" : e.color; ctx.lineWidth = 1.8; ctx.lineCap = "round";
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < 4; i++) {
+        const sw = Math.sin(e.phase + i * 1.7 + (side > 0 ? Math.PI : 0)) * 3;
+        const bx = 2 - i * 2.2, a = (i - 1.5) * 0.5;
+        const kx = bx + Math.cos(a) * 3 + sw * 0.5, ky = side * 9;
+        drawLeg(bx, side * 2, kx + (1.5 - i) * 3, ky, bx + (1.5 - i) * 7 + sw, side * 15);
+      }
+    }
+    ctx.fillStyle = e.flash > 0 ? "#fff" : e.color;
+    ctx.beginPath(); ctx.ellipse(-7, 0, 8, 7, 0, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(3, 0, 4.5, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#ff4040";
+    ctx.beginPath(); ctx.arc(6, -1.6, 1, 0, TAU); ctx.arc(6, 1.6, 1, 0, TAU); ctx.fill();
+    if (e.type === "queen") {
+      ctx.fillStyle = "#c22";
+      ctx.beginPath(); ctx.moveTo(-7, -4); ctx.lineTo(-4, 0); ctx.lineTo(-7, 4); ctx.lineTo(-10, 0); ctx.fill();
+      ctx.fillStyle = "#ffcf4a";
+      ctx.beginPath(); ctx.moveTo(0, -4); ctx.lineTo(1, -7); ctx.lineTo(2, -4.5); ctx.lineTo(3, -7.5); ctx.lineTo(4, -4); ctx.fill();
+    } else {
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.beginPath(); ctx.ellipse(-8, -2.5, 3.5, 2, 0, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawWasp(e) {
+    ctx.save();
+    ctx.translate(e.x, e.y); ctx.rotate(e.angle);
+    if (e.mode === "windup") {
+      ctx.strokeStyle = `rgba(255,60,40,${0.3 + Math.sin(game.time * 30) * 0.2})`;
+      ctx.lineWidth = 2; ctx.setLineDash([6, 6]);
+      ctx.beginPath(); ctx.moveTo(10, 0); ctx.lineTo(220, 0); ctx.stroke(); ctx.setLineDash([]);
+    }
+    ctx.fillStyle = "rgba(0,0,0,0.18)";
+    ctx.beginPath(); ctx.ellipse(-2, 10, 12, 5, 0, 0, TAU); ctx.fill();
+    // wings
+    const flap = Math.sin(game.time * 60) * 0.35;
+    ctx.fillStyle = "rgba(220,240,255,0.55)";
+    for (const side of [-1, 1]) {
+      ctx.beginPath(); ctx.ellipse(-2, side * 8, 9, 4, side * (0.5 + flap), 0, TAU); ctx.fill();
+    }
+    const c = e.flash > 0 ? "#fff" : e.color;
+    ctx.fillStyle = c;
+    ctx.beginPath(); ctx.ellipse(-6, 0, 8, 4.5, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#1a1408";
+    for (let i = 0; i < 3; i++) ctx.fillRect(-11 + i * 3.5, -4.5, 1.6, 9);
+    ctx.beginPath(); ctx.moveTo(-14, 0); ctx.lineTo(-18, 0); ctx.lineWidth = 1.4; ctx.strokeStyle = "#1a1408"; ctx.stroke();
+    ctx.fillStyle = c;
+    ctx.beginPath(); ctx.ellipse(3, 0, 3.5, 3, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#1a1408";
+    ctx.beginPath(); ctx.arc(8, 0, 3, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawBeetle(e) {
+    ctx.save();
+    ctx.translate(e.x, e.y); ctx.rotate(e.angle);
+    const s = e.r / 16;
+    ctx.scale(s, s);
+    ctx.fillStyle = "rgba(0,0,0,0.25)";
+    ctx.beginPath(); ctx.ellipse(-2, 4, 18, 14, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = "#151515"; ctx.lineWidth = 2; ctx.lineCap = "round";
+    for (const side of [-1, 1]) {
+      for (let i = 0; i < 3; i++) {
+        const sw = Math.sin(e.phase + i * 2 + (side > 0 ? Math.PI : 0)) * 3;
+        const bx = 4 - i * 6;
+        drawLeg(bx, side * 8, bx + sw * 0.5, side * 15, bx + (1 - i) * 5 + sw, side * 19);
+      }
+    }
+    const c = e.flash > 0 ? "#fff" : e.color;
+    ctx.fillStyle = "#151515";
+    ctx.beginPath(); ctx.ellipse(12, 0, 5, 6, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = c;
+    ctx.beginPath(); ctx.ellipse(-2, 0, 15, 12, 0, 0, TAU); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.moveTo(-16, 0); ctx.lineTo(8, 0); ctx.stroke();
+    ctx.fillStyle = e.type === "bombardier" ? "rgba(255,230,180,0.3)" : "rgba(140,230,255,0.25)";
+    ctx.beginPath(); ctx.ellipse(-3, -6, 8, 3, 0, 0, TAU); ctx.fill();
+    if (e.type === "bombardier") {
+      ctx.fillStyle = "#1a1a1a";
+      ctx.beginPath(); ctx.arc(-5, 5, 2.5, 0, TAU); ctx.arc(2, -5, 2, 0, TAU); ctx.arc(-9, -3, 2, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawEnemy(e) {
+    if (e.type === "spider") drawSpider(e, 1);
+    else if (e.type === "spiderling") drawSpider(e, 0.6);
+    else if (e.type === "queen") drawSpider(e, 3.2);
+    else if (e.type === "wasp") drawWasp(e);
+    else drawBeetle(e);
+    if (e.type !== "queen" && e.hp < e.maxHp && e.maxHp > 2) {
+      const w = e.r * 2;
+      ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w, 3);
+      ctx.fillStyle = "#e04a3a"; ctx.fillRect(e.x - w / 2, e.y - e.r - 9, w * Math.max(0, e.hp / e.maxHp), 3);
+    }
+  }
+
+  function drawHeart(x, y, s, fill) {
+    ctx.save(); ctx.translate(x, y); ctx.scale(s / 16, s / 16);
+    ctx.beginPath();
+    ctx.moveTo(0, 5);
+    ctx.bezierCurveTo(-8, -1, -8, -9, 0, -5);
+    ctx.bezierCurveTo(8, -9, 8, -1, 0, 5);
+    ctx.fillStyle = fill ? "#e8433a" : "rgba(0,0,0,0.35)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawHud() {
+    const ant = game.ant;
+    // XP bar
+    ctx.fillStyle = "rgba(0,0,0,0.45)"; ctx.fillRect(0, 0, W, 8);
+    ctx.fillStyle = "#ffcf4a"; ctx.fillRect(0, 0, W * game.xp / game.xpNext, 8);
+    // Hearts
+    for (let i = 0; i < ant.maxHp; i++) drawHeart(26 + i * 30, 32, 34, i < ant.hp);
+    // Dash meter
+    const ready = ant.dashCd <= 0;
+    ctx.fillStyle = "rgba(0,0,0,0.4)"; ctx.fillRect(14, 52, 100, 7);
+    ctx.fillStyle = ready ? "#9be36a" : "#7a8a6a";
+    ctx.fillRect(14, 52, 100 * (1 - Math.max(0, ant.dashCd) / game.stats.dashCd), 7);
+    ctx.font = "bold 11px Trebuchet MS, sans-serif"; ctx.textAlign = "left"; ctx.fillStyle = "#f6ead2";
+    ctx.fillText(ready ? "DASH READY" : "dash", 120, 59);
+    // Right side
+    ctx.textAlign = "right";
+    ctx.font = "bold 22px Trebuchet MS, sans-serif";
+    ctx.fillStyle = "#f6ead2";
+    ctx.fillText(fmtTime(game.time), W - 16, 36);
+    ctx.font = "14px Trebuchet MS, sans-serif";
+    ctx.fillStyle = "#e9d8b4";
+    ctx.fillText(`Lv ${game.level}  ·  ${game.kills} squashed`, W - 16, 56);
+    // Boss bar
+    const queen = game.enemies.find(e => e.type === "queen");
+    if (queen) {
+      const w = Math.min(500, W - 40), x = (W - w) / 2, y = H - 34;
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(x, y, w, 14);
+      ctx.fillStyle = "#b63ad0"; ctx.fillRect(x, y, w * Math.max(0, queen.hp / queen.maxHp), 14);
+      ctx.strokeStyle = "#f6ead2"; ctx.strokeRect(x, y, w, 14);
+      ctx.textAlign = "center"; ctx.font = "bold 13px Trebuchet MS, sans-serif"; ctx.fillStyle = "#f6ead2";
+      ctx.fillText("SPIDER QUEEN", W / 2, y - 6);
+    }
+    // Banner
+    if (game.banner.t > 0) {
+      ctx.globalAlpha = Math.min(1, game.banner.t);
+      ctx.textAlign = "center"; ctx.font = "bold 34px Trebuchet MS, sans-serif";
+      ctx.fillStyle = "rgba(0,0,0,0.5)"; ctx.fillText(game.banner.text, W / 2 + 2, H * 0.28 + 2);
+      ctx.fillStyle = "#ffcf4a"; ctx.fillText(game.banner.text, W / 2, H * 0.28);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function draw() {
+    ctx.save();
+    if (game && game.shake > 0) ctx.translate(rand(-game.shake, game.shake) * 0.5, rand(-game.shake, game.shake) * 0.5);
+    ctx.drawImage(bg, 0, 0, W, H);
+    if (!game) { ctx.restore(); return; }
+
+    // pickups
+    for (const p of game.pickups) {
+      const bob = Math.sin(p.t * 5 + p.x) * 1.2;
+      if (p.kind === "crumb") {
+        ctx.fillStyle = "#f3d58a";
+        ctx.beginPath(); ctx.moveTo(p.x - 4, p.y + 2 + bob); ctx.lineTo(p.x, p.y - 4 + bob); ctx.lineTo(p.x + 4, p.y + 3 + bob); ctx.closePath(); ctx.fill();
+        ctx.strokeStyle = "#b8903f"; ctx.lineWidth = 1; ctx.stroke();
+      } else {
+        ctx.fillStyle = "#fff"; ctx.strokeStyle = "#e8433a"; ctx.lineWidth = 2;
+        ctx.fillRect(p.x - 6, p.y - 6 + bob, 12, 12); ctx.strokeRect(p.x - 6, p.y - 6 + bob, 12, 12);
+      }
+    }
+
+    // cursor target marker
+    if (game.state === "playing") {
+      ctx.strokeStyle = "rgba(255,240,200,0.5)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 6 + Math.sin(game.time * 6), 0, TAU); ctx.stroke();
+    }
+
+    // enemy shots
+    for (const p of game.enemyShots) {
+      ctx.fillStyle = "#ff8a2a";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+      ctx.fillStyle = "rgba(255,240,180,0.8)";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.45, 0, TAU); ctx.fill();
+    }
+
+    for (const e of game.enemies) drawEnemy(e);
+
+    // ant + workers
+    const ant = game.ant;
+    for (let i = 0; i < game.stats.workers; i++) {
+      const a = game.workerAngle + i / game.stats.workers * TAU;
+      drawAnt(ant.x + Math.cos(a) * 48, ant.y + Math.sin(a) * 48, a + Math.PI / 2, game.time * 20, 0.6, "#7a3a1a", "rgba(255,200,150,0.3)");
+    }
+    if (game.state !== "dead") {
+      const blink = ant.iframes > 0 && Math.floor(ant.iframes * 14) % 2 === 0;
+      if (!blink) drawAnt(ant.x, ant.y, ant.angle, ant.phase, 1, "#1b120c", "rgba(255,255,255,0.28)");
+    }
+
+    // player shots
+    for (const p of game.shots) {
+      ctx.fillStyle = "rgba(160,240,60,0.35)";
+      ctx.beginPath(); ctx.arc(p.x - p.vx * 0.012, p.y - p.vy * 0.012, p.r * 0.9, 0, TAU); ctx.fill();
+      ctx.fillStyle = "#b7f04a";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    }
+
+    for (const p of game.particles) {
+      ctx.globalAlpha = Math.max(0, p.life / p.max);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    ctx.textAlign = "center"; ctx.font = "bold 15px Trebuchet MS, sans-serif";
+    for (const t of game.texts) {
+      ctx.globalAlpha = Math.min(1, t.t * 2);
+      ctx.fillStyle = t.color; ctx.fillText(t.text, t.x, t.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    drawHud();
+  }
+
+  // ---------- Loop ----------
+  let lastFrame = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - lastFrame) / 1000);
+    lastFrame = now;
+    if (game) {
+      if (game.state === "playing") update(dt);
+      if (game.state !== "paused" && game.state !== "levelup") updateEffects(dt);
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  function start() {
+    ["menu", "dead", "pause", "levelup"].forEach(id => document.getElementById(id).classList.remove("show"));
+    newGame();
+    lastFrame = performance.now();
+  }
+
+  function showBestOnMenu() {
+    const best = loadBest();
+    document.getElementById("best").textContent = best
+      ? `Best run: ${fmtTime(best.time)} · ${best.kills} bugs · level ${best.level}`
+      : "";
+  }
+
+  document.getElementById("startBtn").addEventListener("click", start);
+  document.getElementById("retryBtn").addEventListener("click", start);
+  document.getElementById("resumeBtn").addEventListener("click", togglePause);
+
+  window.addEventListener("resize", resize);
+  resize();
+  showBestOnMenu();
+  requestAnimationFrame(frame);
+
+  // Exposed for debugging in the console.
+  window.antEscape = { get game() { return game; } };
+})();
+</script>
+</body>
+</html>

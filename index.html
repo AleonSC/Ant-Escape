@@ -65,6 +65,7 @@
     <h1>Ant Escape</h1>
     <p>Your little ant scurries toward your cursor. Everything in the garden wants to eat it.</p>
     <p>The ant sprays acid automatically. Collect <b>crumbs</b> to level up and pick a mutation. A boss shows up every 90 seconds.</p>
+    <p>Lure bugs into <b>traps</b>, then step on the glowing pad to spring them. Rocks block bugs and shots; honey slows everyone down.</p>
     <p class="keys"><b>Mouse</b> to move &nbsp;·&nbsp; <b>Click / Space</b> to scurry (dash) &nbsp;·&nbsp; <b>P / Esc</b> to pause</p>
     <p class="keys" id="best"></p>
     <button id="startBtn">Start</button>
@@ -217,7 +218,185 @@
       apply: g => { g.stats.workers += 1; } },
     { id: "dash", name: "Scurry Instinct", desc: "Dash recharges 30% faster.", max: 3,
       apply: g => { g.stats.dashCd *= 0.7; } },
+    { id: "traps", name: "Trap Engineer", desc: "Traps recharge 30% faster.", max: 3,
+      apply: g => { g.stats.trapCd *= 0.7; } },
   ];
+
+  // ---------- Obstacles & traps ----------
+  const TRAP_KINDS = {
+    flytrap:   { r: 62,  cd: 10, color: "#7ad84f", label: "Flytrap" },
+    acorn:     { r: 85,  cd: 9,  color: "#e0a040", label: "Acorn drop" },
+    sprinkler: { r: 140, cd: 15, color: "#5ab8f0", label: "Sprinkler" },
+  };
+  const ACORN_FALL = 0.9, SPRINKLER_TIME = 3.5;
+
+  function generateLayout(g) {
+    const taken = [{ x: W / 2, y: H / 2, r: 120 }];
+    const fits = (x, y, r) =>
+      x - r > 40 && x + r < W - 40 && y - r > 70 && y + r < H - 50 &&
+      taken.every(o => (o.x - x) ** 2 + (o.y - y) ** 2 > (o.r + r + 18) ** 2);
+    const place = r => {
+      for (let i = 0; i < 80; i++) {
+        const x = rand(0, W), y = rand(0, H);
+        if (fits(x, y, r)) { taken.push({ x, y, r }); return { x, y }; }
+      }
+      return null;
+    };
+    const scale = Math.max(0.6, W * H / 800000);
+
+    // Traps go first so they get the most room.
+    const kinds = ["flytrap", "acorn", "sprinkler"];
+    if (scale > 1.6) kinds.push("flytrap", "acorn");
+    for (const kind of kinds) {
+      const k = TRAP_KINDS[kind];
+      // The sprinkler's pad is on the sprinkler itself; the others have a pad outside the trap.
+      const footprint = kind === "sprinkler" ? 75 : k.r;
+      for (let i = 0; i < 120; i++) {
+        const x = rand(0, W), y = rand(0, H);
+        let bx = x, by = y;
+        if (kind !== "sprinkler") {
+          const a = rand(0, TAU);
+          bx = x + Math.cos(a) * (k.r + 34); by = y + Math.sin(a) * (k.r + 34);
+        }
+        if (!fits(x, y, footprint) || (kind !== "sprinkler" && !fits(bx, by, 14))) continue;
+        taken.push({ x, y, r: footprint }, { x: bx, y: by, r: 14 });
+        g.traps.push({ kind, x, y, bx, by, r: k.r, cdMax: k.cd, cd: 0, active: 0, chew: 0, spin: 0, dent: 0 });
+        break;
+      }
+    }
+
+    for (let i = 0; i < Math.round(2 * scale); i++) {
+      const r = rand(38, 58), p = place(r);
+      if (!p) continue;
+      const blobs = [];
+      for (let j = 0; j < 6; j++) {
+        const a = rand(0, TAU), d = rand(0, r * 0.45);
+        blobs.push({ x: Math.cos(a) * d, y: Math.sin(a) * d, r: rand(r * 0.45, r * 0.6) });
+      }
+      g.honey.push({ x: p.x, y: p.y, r, blobs });
+    }
+
+    for (let i = 0; i < Math.round(7 * scale); i++) {
+      const r = rand(16, 34), p = place(r);
+      if (!p) continue;
+      const verts = [];
+      for (let j = 0; j < 10; j++) verts.push(r * rand(0.88, 1.1));
+      g.rocks.push({ x: p.x, y: p.y, r, verts, hue: rand(20, 40), light: rand(42, 58) });
+    }
+  }
+
+  function pushOutOfRocks(o, rad) {
+    for (const k of game.rocks) {
+      const dx = o.x - k.x, dy = o.y - k.y, min = k.r + rad;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < min * min) {
+        const d = Math.sqrt(d2) || 0.01;
+        o.x = k.x + dx / d * min; o.y = k.y + dy / d * min;
+      }
+    }
+  }
+
+  const inHoney = o => game.honey.some(h => dist2(o, h) < (h.r * 0.85) ** 2);
+  const insideRock = p => game.rocks.some(k => dist2(p, k) < k.r * k.r);
+
+  function lineBlocked(ax, ay, bx, by) {
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy || 1;
+    for (const k of game.rocks) {
+      const t = clamp(((k.x - ax) * dx + (k.y - ay) * dy) / len2, 0, 1);
+      const px = ax + dx * t - k.x, py = ay + dy * t - k.y;
+      if (px * px + py * py < (k.r * 0.9) ** 2) return true;
+    }
+    return false;
+  }
+
+  // Bend a walking bug's motion along the edge of any rock it is about to bump into.
+  function steerAroundRocks(e, mvx, mvy) {
+    const sp = Math.hypot(mvx, mvy);
+    if (!sp) return [mvx, mvy];
+    for (const k of game.rocks) {
+      const dx = e.x - k.x, dy = e.y - k.y, d = Math.hypot(dx, dy);
+      const gap = d - k.r - e.r;
+      if (gap > 30 || d === 0) continue;
+      const nx = dx / d, ny = dy / d;
+      if (mvx * nx + mvy * ny >= 0) continue; // moving away from the rock
+      let tx = -ny, ty = nx;
+      if (tx * mvx + ty * mvy < 0) { tx = -tx; ty = -ty; }
+      const w = clamp(1 - gap / 30, 0, 1);
+      const bx = mvx * (1 - w) + tx * sp * w, by = mvy * (1 - w) + ty * sp * w;
+      const bl = Math.hypot(bx, by) || 1;
+      mvx = bx / bl * sp; mvy = by / bl * sp;
+    }
+    return [mvx, mvy];
+  }
+
+  function activateTrap(t) {
+    t.cd = t.cdMax * game.stats.trapCd;
+    game.trapsSprung += 1;
+    if (t.kind === "flytrap") {
+      t.chew = 1.6;
+      game.shake = Math.max(game.shake, 6);
+      burst(t.x, t.y, "#7ad84f", 16, 160);
+      for (const e of game.enemies) {
+        if (e.dead || dist2(e, t) > (t.r + e.r * 0.5) ** 2) continue;
+        if (e.type === "queen") damageEnemy(e, e.maxHp * 0.15);
+        else damageEnemy(e, e.hp + 1);
+      }
+    } else if (t.kind === "acorn") {
+      t.active = ACORN_FALL;
+    } else {
+      t.active = SPRINKLER_TIME;
+    }
+  }
+
+  function acornImpact(t) {
+    t.dent = 1.5;
+    game.shake = 14;
+    burst(t.x, t.y, "#8a6a42", 30, 260);
+    burst(t.x, t.y, "#e0a040", 10, 180);
+    const dmg = 16 * (1 + game.time / 75);
+    for (const e of game.enemies) {
+      if (e.dead || dist2(e, t) > (t.r + e.r * 0.5) ** 2) continue;
+      const a = Math.atan2(e.y - t.y, e.x - t.x);
+      damageEnemy(e, dmg, Math.cos(a) * 500, Math.sin(a) * 500);
+    }
+    // It doesn't care whose head it lands on.
+    if (dist2(game.ant, t) < t.r * t.r) hurtAnt(1);
+  }
+
+  function sprinklerTick(t, dt) {
+    t.spin += dt * 9;
+    const dps = 3 * (1 + game.time / 75);
+    for (const e of game.enemies) {
+      const dx = e.x - t.x, dy = e.y - t.y, d = Math.hypot(dx, dy) || 1;
+      if (e.dead || d > t.r + e.r) continue;
+      const push = (e.type === "queen" ? 300 : 1400) * dt;
+      e.vx += dx / d * push; e.vy += dy / d * push;
+      e.hp -= dps * dt;
+      if (e.hp <= 0) killEnemy(e);
+    }
+    game.enemyShots = game.enemyShots.filter(p => dist2(p, t) > t.r * t.r);
+    for (let j = 0; j < 4; j++) {
+      const a = t.spin + j * TAU / 4 + rand(-0.1, 0.1), d = rand(10, t.r);
+      game.particles.push({ x: t.x + Math.cos(a) * d, y: t.y + Math.sin(a) * d, vx: Math.cos(a) * 60, vy: Math.sin(a) * 60,
+                            life: 0.35, max: 0.35, color: "rgba(150,210,255,0.8)", r: rand(1.5, 3) });
+    }
+  }
+
+  function updateTraps(dt) {
+    const ant = game.ant;
+    for (const t of game.traps) {
+      if (t.cd > 0) t.cd -= dt;
+      if (t.chew > 0) t.chew -= dt;
+      if (t.dent > 0) t.dent -= dt;
+      if (t.active > 0) {
+        t.active -= dt;
+        if (t.kind === "sprinkler") sprinklerTick(t, dt);
+        if (t.kind === "acorn" && t.active <= 0) acornImpact(t);
+      }
+      const onPad = (ant.x - t.bx) ** 2 + (ant.y - t.by) ** 2 < (ant.r + 12) ** 2;
+      if (onPad && t.cd <= 0 && t.active <= 0 && game.state === "playing") activateTrap(t);
+    }
+  }
 
   // ---------- Game state ----------
   let game = null;
@@ -239,7 +418,7 @@
       ant: { x: W / 2, y: H / 2, r: 9, angle: -Math.PI / 2, phase: 0, hp: 5, maxHp: 5,
              speed: 210, iframes: 0, dashT: 0, dashCd: 0, dashDir: 0, regenAcc: 0 },
       stats: { damage: 1.5, fireDelay: 0.45, shots: 1, pierce: 0, range: 300, magnet: 70,
-               projSpeed: 430, regen: 0, thorns: 0, workers: 0, dashCd: 2.5 },
+               projSpeed: 430, regen: 0, thorns: 0, workers: 0, dashCd: 2.5, trapCd: 1 },
       upgradeLevels: {},
       fireT: 0,
       workerAngle: 0,
@@ -249,7 +428,12 @@
       pickups: [],
       particles: [],
       texts: [],
+      rocks: [],
+      honey: [],
+      traps: [],
+      trapsSprung: 0,
     };
+    generateLayout(game);
     mouse.x = W / 2; mouse.y = H / 2;
   }
 
@@ -381,10 +565,18 @@
         break;
     }
 
+    // Wasps fly over everything; the rest walk around rocks and get stuck in honey.
+    const walks = e.type !== "wasp";
+    if (walks) {
+      [mvx, mvy] = steerAroundRocks(e, mvx, mvy);
+      if (inHoney(e)) { mvx *= 0.45; mvy *= 0.45; }
+    }
+
     // knockback decay
     e.vx *= Math.pow(0.02, dt); e.vy *= Math.pow(0.02, dt);
     e.x += (mvx + e.vx) * dt;
     e.y += (mvy + e.vy) * dt;
+    if (walks) pushOutOfRocks(e, e.r * 0.8);
     e.phase += Math.hypot(mvx, mvy) * dt * 0.12;
     if (e.flash > 0) e.flash -= dt;
   }
@@ -467,7 +659,7 @@
     let best = null, bestD = s.range * s.range;
     for (const e of game.enemies) {
       const d = dist2(e, ant);
-      if (d < bestD) { bestD = d; best = e; }
+      if (d < bestD && !lineBlocked(ant.x, ant.y, e.x, e.y)) { bestD = d; best = e; }
     }
     if (!best) return;
     // lead the target slightly
@@ -583,6 +775,7 @@
       ["Survived", fmtTime(game.time)],
       ["Bugs squashed", game.kills],
       ["Level reached", game.level],
+      ["Traps sprung", game.trapsSprung],
       ["Queens slain", Math.max(0, game.bossCount - (game.enemies.some(e => e.type === "queen") ? 1 : 0))],
     ];
     const box = document.getElementById("deathStats");
@@ -616,11 +809,12 @@
       const dx = mouse.x - ant.x, dy = mouse.y - ant.y;
       const d = Math.hypot(dx, dy);
       if (d > 3) {
-        moved = Math.min(d, ant.speed * dt);
+        moved = Math.min(d, ant.speed * (inHoney(ant) ? 0.5 : 1) * dt);
         ant.x += dx / d * moved; ant.y += dy / d * moved;
         ant.angle = angleLerp(ant.angle, Math.atan2(dy, dx), Math.min(1, dt * 12));
       }
     }
+    pushOutOfRocks(ant, ant.r * 0.9);
     ant.x = clamp(ant.x, ant.r, W - ant.r);
     ant.y = clamp(ant.y, ant.r, H - ant.r);
     ant.phase += moved * 0.22;
@@ -632,6 +826,7 @@
     }
 
     updateSpawning(dt);
+    updateTraps(dt);
     updateWeapon(dt);
     for (const e of game.enemies) updateEnemy(e, dt);
     separateEnemies();
@@ -640,6 +835,7 @@
     // Player shots
     for (const p of game.shots) {
       p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      if (insideRock(p)) { p.life = 0; burst(p.x, p.y, "#b7f04a", 3, 60); continue; }
       for (const e of game.enemies) {
         if (e.dead || p.hit.has(e)) continue;
         if (dist2(p, e) < (p.r + e.r) ** 2) {
@@ -655,6 +851,7 @@
     // Enemy shots
     for (const p of game.enemyShots) {
       p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
+      if (insideRock(p)) { p.life = 0; burst(p.x, p.y, "#ff8a2a", 3, 60); continue; }
       if (game.state === "playing" && dist2(p, ant) < (p.r + ant.r * 0.8) ** 2 && ant.iframes <= 0 && ant.dashT <= 0) {
         p.life = 0; hurtAnt(1);
       }
@@ -853,6 +1050,167 @@
     }
   }
 
+  function drawHoney(h) {
+    ctx.fillStyle = "rgba(205,130,25,0.82)";
+    for (const b of h.blobs) { ctx.beginPath(); ctx.arc(h.x + b.x, h.y + b.y, b.r, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = "rgba(255,200,90,0.45)";
+    for (const b of h.blobs) { ctx.beginPath(); ctx.arc(h.x + b.x - b.r * 0.25, h.y + b.y - b.r * 0.25, b.r * 0.55, 0, TAU); ctx.fill(); }
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.beginPath(); ctx.ellipse(h.x - h.r * 0.25, h.y - h.r * 0.3, h.r * 0.18, h.r * 0.08, -0.5, 0, TAU); ctx.fill();
+  }
+
+  function drawRock(k) {
+    const pts = k.verts.map((v, i) => {
+      const a = i / k.verts.length * TAU;
+      return [k.x + Math.cos(a) * v, k.y + Math.sin(a) * v];
+    });
+    const path = (ox, oy) => {
+      ctx.beginPath();
+      pts.forEach(([x, y], i) => i ? ctx.lineTo(x + ox, y + oy) : ctx.moveTo(x + ox, y + oy));
+      ctx.closePath();
+    };
+    ctx.fillStyle = "rgba(0,0,0,0.3)"; path(4, 6); ctx.fill();
+    const g = ctx.createRadialGradient(k.x - k.r * 0.4, k.y - k.r * 0.4, k.r * 0.1, k.x, k.y, k.r * 1.1);
+    g.addColorStop(0, `hsl(${k.hue}, 10%, ${k.light + 18}%)`);
+    g.addColorStop(1, `hsl(${k.hue}, 12%, ${k.light - 18}%)`);
+    ctx.fillStyle = g; path(0, 0); ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+
+  function drawPad(t) {
+    const k = TRAP_KINDS[t.kind];
+    const ready = t.cd <= 0 && t.active <= 0;
+    ctx.fillStyle = "#3a2a18";
+    ctx.beginPath(); ctx.arc(t.bx, t.by, 13, 0, TAU); ctx.fill();
+    if (ready) {
+      const pulse = 0.5 + Math.sin(game.time * 5) * 0.5;
+      ctx.strokeStyle = k.color; ctx.globalAlpha = 0.3 + pulse * 0.5; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(t.bx, t.by, 15 + pulse * 4, 0, TAU); ctx.stroke();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = k.color;
+      ctx.beginPath(); ctx.arc(t.bx, t.by, 9, 0, TAU); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.45)";
+      ctx.beginPath(); ctx.arc(t.bx - 3, t.by - 3, 3, 0, TAU); ctx.fill();
+    } else {
+      ctx.fillStyle = "#6a5a48";
+      ctx.beginPath(); ctx.arc(t.bx, t.by, 9, 0, TAU); ctx.fill();
+      const frac = clamp(t.cd / (t.cdMax * game.stats.trapCd), 0, 1);
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.beginPath(); ctx.moveTo(t.bx, t.by); ctx.arc(t.bx, t.by, 9, -Math.PI / 2, -Math.PI / 2 + frac * TAU); ctx.fill();
+    }
+    ctx.font = "bold 11px Trebuchet MS, sans-serif"; ctx.textAlign = "center";
+    ctx.fillStyle = ready ? "rgba(255,245,220,0.9)" : "rgba(255,245,220,0.4)";
+    ctx.fillText(k.label, t.bx, t.by - 19);
+  }
+
+  function drawFlytrap(t) {
+    const closed = t.chew > 0;
+    const wob = closed ? Math.sin(t.chew * 25) * 1.5 : 0;
+    ctx.save(); ctx.translate(t.x, t.y);
+    // leaves
+    ctx.fillStyle = "#3f7a2a";
+    for (let i = 0; i < 5; i++) {
+      ctx.beginPath(); ctx.ellipse(Math.cos(i * 1.26) * 26, Math.sin(i * 1.26) * 26, 16, 6, i * 1.26, 0, TAU); ctx.fill();
+    }
+    const gap = closed ? 0 : 9;
+    for (const side of [-1, 1]) {
+      ctx.save(); ctx.translate(side * gap + wob, 0);
+      const a0 = side > 0 ? -Math.PI / 2 : Math.PI / 2, a1 = a0 + Math.PI;
+      ctx.fillStyle = "#6cbf3c";
+      ctx.beginPath(); ctx.ellipse(0, 0, 24, 32, 0, a0, a1); ctx.closePath(); ctx.fill();
+      if (!closed) {
+        ctx.fillStyle = "#c8323a";
+        ctx.beginPath(); ctx.ellipse(0, 0, 17, 25, 0, a0, a1); ctx.closePath(); ctx.fill();
+      }
+      ctx.fillStyle = "#e8f0c0";
+      for (let i = -3; i <= 3; i++) {
+        const y = i * 8.5;
+        ctx.beginPath(); ctx.moveTo(0, y - 2.5); ctx.lineTo(-side * 7, y); ctx.lineTo(0, y + 2.5); ctx.fill();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  function drawSprinkler(t) {
+    if (t.active > 0) {
+      ctx.strokeStyle = "rgba(150,210,255,0.55)"; ctx.lineWidth = 4; ctx.lineCap = "round";
+      for (let j = 0; j < 4; j++) {
+        const a = t.spin + j * TAU / 4;
+        ctx.beginPath(); ctx.moveTo(t.x, t.y);
+        ctx.quadraticCurveTo(t.x + Math.cos(a + 0.2) * t.r * 0.5, t.y + Math.sin(a + 0.2) * t.r * 0.5,
+                             t.x + Math.cos(a) * t.r, t.y + Math.sin(a) * t.r);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "rgba(120,190,255,0.12)";
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, TAU); ctx.fill();
+    }
+    ctx.fillStyle = "#4a5560";
+    ctx.beginPath(); ctx.arc(t.x, t.y, 16, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#9aa6b0";
+    ctx.beginPath(); ctx.arc(t.x, t.y, 12, 0, TAU); ctx.fill();
+  }
+
+  function drawAcorn(x, y, s, rot) {
+    ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+    ctx.fillStyle = "#b9762c";
+    ctx.beginPath(); ctx.ellipse(0, 3, 9, 11, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = "#6b4520";
+    ctx.beginPath(); ctx.ellipse(0, -5, 11, 6, 0, 0, TAU); ctx.fill();
+    ctx.fillRect(-1.5, -14, 3, 6);
+    ctx.fillStyle = "rgba(255,255,255,0.25)";
+    ctx.beginPath(); ctx.ellipse(-3, 4, 2.5, 5, 0, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawTrapsGround() {
+    for (const t of game.traps) {
+      const k = TRAP_KINDS[t.kind];
+      const ready = t.cd <= 0 && t.active <= 0;
+      // danger zone
+      if (t.kind === "acorn" && t.active > 0) {
+        ctx.fillStyle = `rgba(230,60,40,${0.15 + Math.sin(game.time * 25) * 0.08})`;
+        ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, TAU); ctx.fill();
+      }
+      ctx.strokeStyle = k.color; ctx.lineWidth = 2;
+      ctx.globalAlpha = ready ? 0.55 : 0.18;
+      ctx.setLineDash([8, 7]);
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, TAU); ctx.stroke();
+      // tether from pad to trap
+      if (t.bx !== t.x || t.by !== t.y) {
+        ctx.setLineDash([3, 6]);
+        ctx.beginPath(); ctx.moveTo(t.bx, t.by); ctx.lineTo(t.x, t.y); ctx.stroke();
+      }
+      ctx.setLineDash([]); ctx.globalAlpha = 1;
+      if (t.kind === "flytrap") drawFlytrap(t);
+      else if (t.kind === "sprinkler") drawSprinkler(t);
+      else if (t.dent > 0) {
+        ctx.globalAlpha = Math.min(1, t.dent);
+        ctx.fillStyle = "rgba(40,25,10,0.35)";
+        ctx.beginPath(); ctx.ellipse(t.x, t.y + 6, 24, 12, 0, 0, TAU); ctx.fill();
+        drawAcorn(t.x, t.y, 2, 1.2);
+        ctx.globalAlpha = 1;
+      } else {
+        // crosshair mark under the branch
+        ctx.strokeStyle = "rgba(60,35,10,0.45)"; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(t.x - 12, t.y - 12); ctx.lineTo(t.x + 12, t.y + 12);
+        ctx.moveTo(t.x + 12, t.y - 12); ctx.lineTo(t.x - 12, t.y + 12); ctx.stroke();
+      }
+      if (t.kind !== "sprinkler") drawPad(t);
+    }
+    for (const t of game.traps) if (t.kind === "sprinkler") drawPad(t);
+  }
+
+  function drawFallingAcorns() {
+    for (const t of game.traps) {
+      if (t.kind !== "acorn" || t.active <= 0) continue;
+      const p = 1 - t.active / ACORN_FALL;
+      ctx.fillStyle = `rgba(0,0,0,${0.15 + p * 0.3})`;
+      ctx.beginPath(); ctx.ellipse(t.x, t.y + 6, 8 + p * 20, 4 + p * 10, 0, 0, TAU); ctx.fill();
+      drawAcorn(t.x, t.y - (1 - p) * (1 - p) * 420, 2 + (1 - p) * 1.5, p * 5);
+    }
+  }
+
   function drawHeart(x, y, s, fill) {
     ctx.save(); ctx.translate(x, y); ctx.scale(s / 16, s / 16);
     ctx.beginPath();
@@ -913,6 +1271,9 @@
     ctx.drawImage(bg, 0, 0, W, H);
     if (!game) { ctx.restore(); return; }
 
+    for (const h of game.honey) drawHoney(h);
+    drawTrapsGround();
+
     // pickups
     for (const p of game.pickups) {
       const bob = Math.sin(p.t * 5 + p.x) * 1.2;
@@ -931,6 +1292,8 @@
       ctx.strokeStyle = "rgba(255,240,200,0.5)"; ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 6 + Math.sin(game.time * 6), 0, TAU); ctx.stroke();
     }
+
+    for (const k of game.rocks) drawRock(k);
 
     // enemy shots
     for (const p of game.enemyShots) {
@@ -967,6 +1330,8 @@
       ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, TAU); ctx.fill();
     }
     ctx.globalAlpha = 1;
+
+    drawFallingAcorns();
 
     ctx.textAlign = "center"; ctx.font = "bold 15px Trebuchet MS, sans-serif";
     for (const t of game.texts) {
